@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-label="folio">
+  <rect width="1200" height="320" fill="#07090d"/>
+  <g fill="none" stroke="#18202b" stroke-width="1">
+    <path d="M0 32H1200M0 64H1200M0 96H1200M0 128H1200M0 160H1200M0 192H1200M0 224H1200M0 256H1200M0 288H1200"/>
+    <path d="M32 0V320M64 0V320M96 0V320M128 0V320M160 0V320M192 0V320M224 0V320M256 0V320M288 0V320M320 0V320M352 0V320M384 0V320M416 0V320M448 0V320M480 0V320M512 0V320M544 0V320M576 0V320M608 0V320M640 0V320M672 0V320M704 0V320M736 0V320M768 0V320M800 0V320M832 0V320M864 0V320M896 0V320M928 0V320M960 0V320M992 0V320M1024 0V320M1056 0V320M1088 0V320M1120 0V320M1152 0V320M1184 0V320"/>
+  </g>
+  <rect width="8" height="320" fill="#e6c07b"/>
+  <text x="48" y="150" fill="#f4f7fb" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="72" font-weight="700">folio</text>
+  <text x="52" y="210" fill="#e6c07b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="22">double-entry · minor units · Rust</text>
+</svg>

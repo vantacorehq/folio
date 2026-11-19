@@ -1,0 +1,7 @@
+[package]
+name = "folio"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Double-entry journal. Minor units. Unbalanced transactions are not written."
