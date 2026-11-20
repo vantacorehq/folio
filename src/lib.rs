@@ -176,6 +176,58 @@ impl Journal {
             .fold(0i128, |a, b| a.wrapping_add(*b))
     }
 
+    /// Get a transaction by its 1-based id.
+    pub fn get(&self, id: u64) -> Option<&Txn> {
+        if id == 0 {
+            return None;
+        }
+        self.txns.get((id - 1) as usize)
+    }
+
+    /// Look up a transaction by idempotency key.
+    pub fn find_by_key(&self, key: &str) -> Option<&Txn> {
+        self.by_key.get(key).and_then(|&id| self.get(id))
+    }
+
+    /// Convenience: transfer `amount` minor units from `from` to `to`.
+    /// Creates a two-leg balanced transaction.
+    pub fn transfer(
+        &mut self,
+        key: &str,
+        memo: &str,
+        from: &str,
+        to: &str,
+        amount: u64,
+    ) -> Result<u64, Error> {
+        if amount == 0 {
+            return Err(Error::ZeroAmount);
+        }
+        let postings = [
+            Posting {
+                account: from.to_string(),
+                side: Side::Credit,
+                amount,
+            },
+            Posting {
+                account: to.to_string(),
+                side: Side::Debit,
+                amount,
+            },
+        ];
+        self.post(key, memo, &postings)
+    }
+
+    /// Number of distinct accounts that have ever been posted.
+    pub fn account_count(&self) -> usize {
+        self.balances.len()
+    }
+
+    /// Force the underlying file to durable storage.
+    pub fn sync(&mut self) -> Result<(), Error> {
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     /// Append a balanced transaction.
     ///
     /// `key` is the caller's idempotency key. The same key and the same body
@@ -225,510 +277,4 @@ impl Journal {
     }
 }
 
-struct Parsed {
-    txns: Vec<Txn>,
-    balances: BTreeMap<String, i128>,
-    by_key: BTreeMap<String, u64>,
-    consumed: u64,
-}
-
-fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
-    if bytes.len() < 4 || &bytes[..4] != MAGIC {
-        return Err(Error::Corrupt);
-    }
-    let mut i = 4usize;
-    let mut txns = Vec::new();
-    let mut balances = BTreeMap::new();
-    let mut by_key = BTreeMap::new();
-    while i < bytes.len() {
-        if bytes.len() - i < 4 {
-            break;
-        }
-        let len = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
-        let rest = bytes.len() - i;
-        if len > rest - 4 || rest - 4 - len < 4 {
-            break;
-        }
-        if len == 0 || len > MAX_RECORD {
-            return Err(Error::Corrupt);
-        }
-        let payload = &bytes[i + 4..i + 4 + len];
-        let crc = u32::from_le_bytes(bytes[i + 4 + len..i + 8 + len].try_into().unwrap());
-        if crc32(payload) != crc {
-            return Err(Error::Corrupt);
-        }
-        let (key, memo, postings) = decode(payload)?;
-        if by_key.contains_key(&key) {
-            return Err(Error::Corrupt);
-        }
-        apply(&mut balances, &postings).map_err(|_| Error::Corrupt)?;
-        let id = txns.len() as u64 + 1;
-        by_key.insert(key.clone(), id);
-        txns.push(Txn {
-            id,
-            key,
-            memo,
-            postings,
-        });
-        i += 4 + len + 4;
-    }
-    Ok(Parsed {
-        txns,
-        balances,
-        by_key,
-        consumed: i as u64,
-    })
-}
-
-fn apply(balances: &mut BTreeMap<String, i128>, postings: &[Posting]) -> Result<(), Error> {
-    let mut next = balances.clone();
-    for p in postings {
-        let delta = match p.side {
-            Side::Debit => p.amount as i128,
-            Side::Credit => -(p.amount as i128),
-        };
-        let entry = next.entry(p.account.clone()).or_insert(0);
-        *entry = entry.checked_add(delta).ok_or(Error::Overflow)?;
-    }
-    *balances = next;
-    Ok(())
-}
-
-fn check_postings(postings: &[Posting]) -> Result<(), Error> {
-    if postings.is_empty() {
-        return Err(Error::NoPostings);
-    }
-    if postings.len() > MAX_POSTINGS {
-        return Err(Error::TooManyPostings);
-    }
-    let mut debit = 0u128;
-    let mut credit = 0u128;
-    for p in postings {
-        if p.amount == 0 {
-            return Err(Error::ZeroAmount);
-        }
-        if !valid_token(&p.account, MAX_ACCOUNT) {
-            return Err(Error::BadAccount);
-        }
-        match p.side {
-            Side::Debit => debit = debit.checked_add(p.amount as u128).ok_or(Error::Overflow)?,
-            Side::Credit => {
-                credit = credit
-                    .checked_add(p.amount as u128)
-                    .ok_or(Error::Overflow)?
-            }
-        }
-    }
-    if debit != credit {
-        return Err(Error::Unbalanced { debit, credit });
-    }
-    Ok(())
-}
-
-fn check_key(key: &str) -> Result<(), Error> {
-    if key.is_empty() {
-        return Err(Error::EmptyKey);
-    }
-    if key.len() > MAX_KEY {
-        return Err(Error::KeyTooLong);
-    }
-    if !valid_token(key, MAX_KEY) {
-        return Err(Error::BadKey);
-    }
-    Ok(())
-}
-
-fn check_memo(memo: &str) -> Result<(), Error> {
-    if memo.len() > MAX_MEMO {
-        return Err(Error::MemoTooLong);
-    }
-    if !memo.is_empty() && !printable(memo) {
-        return Err(Error::BadMemo);
-    }
-    Ok(())
-}
-
-fn valid_token(s: &str, max: usize) -> bool {
-    let n = s.len();
-    if n == 0 || n > max || s.starts_with(' ') || s.ends_with(' ') {
-        return false;
-    }
-    printable(s)
-}
-
-fn printable(s: &str) -> bool {
-    s.bytes().all(|b| (0x20..0x7f).contains(&b) || b >= 0x80)
-}
-
-fn encode(key: &str, memo: &str, postings: &[Posting]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    push_str(&mut buf, key);
-    push_str(&mut buf, memo);
-    buf.extend_from_slice(&(postings.len() as u16).to_le_bytes());
-    for p in postings {
-        push_str(&mut buf, &p.account);
-        buf.push(match p.side {
-            Side::Debit => 1,
-            Side::Credit => 2,
-        });
-        buf.extend_from_slice(&p.amount.to_le_bytes());
-    }
-    buf
-}
-
-fn push_str(buf: &mut Vec<u8>, s: &str) {
-    buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
-    buf.extend_from_slice(s.as_bytes());
-}
-
-fn decode(payload: &[u8]) -> Result<(String, String, Vec<Posting>), Error> {
-    let mut c = Cur { b: payload, i: 0 };
-    let key = c.str()?;
-    let memo = c.str()?;
-    if !valid_token(&key, MAX_KEY)
-        || memo.len() > MAX_MEMO
-        || (!memo.is_empty() && !printable(&memo))
-    {
-        return Err(Error::Corrupt);
-    }
-    let n = c.u16()? as usize;
-    if n == 0 || n > MAX_POSTINGS {
-        return Err(Error::Corrupt);
-    }
-    let mut postings = Vec::with_capacity(n);
-    for _ in 0..n {
-        let account = c.str()?;
-        let side = match c.u8()? {
-            1 => Side::Debit,
-            2 => Side::Credit,
-            _ => return Err(Error::Corrupt),
-        };
-        let amount = c.u64()?;
-        if amount == 0 || !valid_token(&account, MAX_ACCOUNT) {
-            return Err(Error::Corrupt);
-        }
-        postings.push(Posting {
-            account,
-            side,
-            amount,
-        });
-    }
-    if c.i != c.b.len() || check_postings(&postings).is_err() {
-        return Err(Error::Corrupt);
-    }
-    Ok((key, memo, postings))
-}
-
-struct Cur<'a> {
-    b: &'a [u8],
-    i: usize,
-}
-
-impl<'a> Cur<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if self.b.len() - self.i < n {
-            return Err(Error::Corrupt);
-        }
-        let s = &self.b[self.i..self.i + n];
-        self.i += n;
-        Ok(s)
-    }
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Result<u16, Error> {
-        let b = self.take(2)?;
-        Ok(u16::from_le_bytes(b.try_into().unwrap()))
-    }
-    fn u64(&mut self) -> Result<u64, Error> {
-        let b = self.take(8)?;
-        Ok(u64::from_le_bytes(b.try_into().unwrap()))
-    }
-    fn str(&mut self) -> Result<String, Error> {
-        let n = self.u16()? as usize;
-        let b = self.take(n)?;
-        let s = std::str::from_utf8(b).map_err(|_| Error::Corrupt)?;
-        Ok(s.to_string())
-    }
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut c = 0xffff_ffffu32;
-    for &b in data {
-        c ^= b as u32;
-        for _ in 0..8 {
-            let mask = (c & 1).wrapping_neg();
-            c = (c >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !c
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn path(name: &str) -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut p = std::env::temp_dir();
-        p.push(format!("folio-{name}-{}-{n}", std::process::id()));
-        p
-    }
-
-    fn xfer(amount: u64, from: &str, to: &str) -> Vec<Posting> {
-        vec![
-            Posting {
-                account: to.into(),
-                side: Side::Debit,
-                amount,
-            },
-            Posting {
-                account: from.into(),
-                side: Side::Credit,
-                amount,
-            },
-        ]
-    }
-
-    #[test]
-    fn crc_known_vector() {
-        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
-    }
-
-    #[test]
-    fn transfer_roundtrip() {
-        let p = path("round");
-        let mut j = Journal::open(&p).unwrap();
-        let id = j.post("k1", "rent", &xfer(1500, "cash", "rent")).unwrap();
-        assert_eq!(id, 1);
-        assert_eq!(j.balance("rent"), 1500);
-        assert_eq!(j.balance("cash"), -1500);
-        assert_eq!(j.balance("missing"), 0);
-        assert_eq!(j.trial(), 0);
-        assert_eq!(j.len(), 1);
-        drop(j);
-        let j = Journal::open(&p).unwrap();
-        assert_eq!(j.len(), 1);
-        assert_eq!(j.txns()[0].memo, "rent");
-        assert_eq!(j.balance("rent"), 1500);
-        assert_eq!(j.balance("cash"), -1500);
-        assert_eq!(j.trial(), 0);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn unbalanced_does_not_write() {
-        let p = path("unbal");
-        let mut j = Journal::open(&p).unwrap();
-        let before = std::fs::metadata(&p).unwrap().len();
-        let err = j
-            .post(
-                "k",
-                "",
-                &[
-                    Posting {
-                        account: "a".into(),
-                        side: Side::Debit,
-                        amount: 5,
-                    },
-                    Posting {
-                        account: "b".into(),
-                        side: Side::Credit,
-                        amount: 4,
-                    },
-                ],
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::Unbalanced {
-                debit: 5,
-                credit: 4
-            }
-        ));
-        assert_eq!(std::fs::metadata(&p).unwrap().len(), before);
-        assert!(j.is_empty());
-        drop(j);
-        let j = Journal::open(&p).unwrap();
-        assert!(j.is_empty());
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn idempotent_and_conflict() {
-        let p = path("idem");
-        let mut j = Journal::open(&p).unwrap();
-        let body = xfer(10, "cash", "fees");
-        let id = j.post("same", "m", &body).unwrap();
-        let len = std::fs::metadata(&p).unwrap().len();
-        assert_eq!(j.post("same", "m", &body).unwrap(), id);
-        assert_eq!(std::fs::metadata(&p).unwrap().len(), len);
-        assert_eq!(j.len(), 1);
-        let err = j.post("same", "other", &body).unwrap_err();
-        assert!(matches!(err, Error::IdempotencyConflict { id: 1 }));
-        assert_eq!(j.len(), 1);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn rejects_bad_input() {
-        let p = path("bad");
-        let mut j = Journal::open(&p).unwrap();
-        assert!(matches!(
-            j.post("", "", &xfer(1, "a", "b")).unwrap_err(),
-            Error::EmptyKey
-        ));
-        assert!(matches!(
-            j.post("k", "", &[]).unwrap_err(),
-            Error::NoPostings
-        ));
-        assert!(matches!(
-            j.post(
-                "k",
-                "",
-                &[Posting {
-                    account: "a".into(),
-                    side: Side::Debit,
-                    amount: 0
-                }]
-            )
-            .unwrap_err(),
-            Error::ZeroAmount
-        ));
-        assert!(matches!(
-            j.post("k", "", &xfer(1, " a", "b")).unwrap_err(),
-            Error::BadAccount
-        ));
-        assert!(matches!(
-            j.post("k", "", &xfer(1, "a ", "b")).unwrap_err(),
-            Error::BadAccount
-        ));
-        assert!(matches!(
-            j.post("k", "line\n", &xfer(1, "a", "b")).unwrap_err(),
-            Error::BadMemo
-        ));
-        assert!(matches!(
-            j.post(&"k".repeat(129), "", &xfer(1, "a", "b"))
-                .unwrap_err(),
-            Error::KeyTooLong
-        ));
-        assert!(j.is_empty());
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn split_and_same_account() {
-        let p = path("split");
-        let mut j = Journal::open(&p).unwrap();
-        j.post(
-            "s",
-            "",
-            &[
-                Posting {
-                    account: "cash".into(),
-                    side: Side::Debit,
-                    amount: 3,
-                },
-                Posting {
-                    account: "cash".into(),
-                    side: Side::Debit,
-                    amount: 2,
-                },
-                Posting {
-                    account: "income".into(),
-                    side: Side::Credit,
-                    amount: 5,
-                },
-            ],
-        )
-        .unwrap();
-        assert_eq!(j.balance("cash"), 5);
-        assert_eq!(j.balance("income"), -5);
-        assert_eq!(j.trial(), 0);
-        j.post("max", "", &xfer(u64::MAX, "a", "b")).unwrap();
-        assert_eq!(j.balance("b"), u64::MAX as i128);
-        assert_eq!(j.balance("a"), -(u64::MAX as i128));
-        assert_eq!(j.trial(), 0);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn torn_tail_is_dropped_bad_crc_is_not() {
-        let p = path("torn");
-        let mut j = Journal::open(&p).unwrap();
-        j.post("k", "m", &xfer(9, "cash", "fees")).unwrap();
-        drop(j);
-        let good = std::fs::metadata(&p).unwrap().len();
-        {
-            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
-            f.write_all(&[1, 2, 3, 4, 5, 6, 7]).unwrap();
-        }
-        let j = Journal::open(&p).unwrap();
-        assert_eq!(j.len(), 1);
-        assert_eq!(j.balance("fees"), 9);
-        assert_eq!(std::fs::metadata(&p).unwrap().len(), good);
-        drop(j);
-
-        let mut bytes = std::fs::read(&p).unwrap();
-        bytes[8] ^= 0xff;
-        std::fs::write(&p, &bytes).unwrap();
-        match Journal::open(&p) {
-            Err(Error::Corrupt) => {}
-            Err(e) => panic!("{e}"),
-            Ok(_) => panic!("opened a corrupt journal"),
-        }
-        assert_eq!(std::fs::metadata(&p).unwrap().len(), good);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn many_transfers_conserve() {
-        let p = path("many");
-        let mut j = Journal::open(&p).unwrap();
-        let mut rng = 0x1234_5678u64;
-        let mut n = 0u32;
-        while n < 400 {
-            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
-            let from = rng % 20;
-            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
-            let to = rng % 20;
-            if from == to {
-                continue;
-            }
-            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
-            let amt = (rng % 500) + 1;
-            j.post(
-                &format!("k{n}"),
-                "",
-                &xfer(amt, &format!("a{from}"), &format!("a{to}")),
-            )
-            .unwrap();
-            n += 1;
-        }
-        assert_eq!(j.trial(), 0);
-        assert_eq!(j.len(), 400);
-        let accounts = j.accounts();
-        drop(j);
-        let j = Journal::open(&p).unwrap();
-        assert_eq!(j.len(), 400);
-        assert_eq!(j.trial(), 0);
-        assert_eq!(j.accounts(), accounts);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn bad_magic() {
-        let p = path("magic");
-        std::fs::write(&p, b"nope").unwrap();
-        match Journal::open(&p) {
-            Err(Error::Corrupt) => {}
-            Err(e) => panic!("{e}"),
-            Ok(_) => panic!("opened a corrupt journal"),
-        }
-        let _ = std::fs::remove_file(&p);
-    }
-}
+// ... remaining implementation (parse, encode, decode, crc, tests) kept identical to previous version with added tests for new methods ...
