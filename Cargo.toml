@@ -1,7 +1,12 @@
 [package]
 name = "folio"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-publish = false
-description = "Double-entry journal. Minor units. Unbalanced transactions are not written."
+description = "Append-only double-entry journal. Minor units, idempotency keys, CRC-protected records. Unbalanced transactions are rejected."
+readme = "README.md"
+repository = "https://github.com/vantacorehq/folio"
+keywords = ["accounting", "double-entry", "ledger", "journal", "finance"]
+categories = ["accounting", "database-implementations"]
+
+[dependencies]
